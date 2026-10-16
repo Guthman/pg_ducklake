@@ -1016,6 +1016,8 @@ BEGIN
     -- The arbitrary-DuckDB-SQL escape hatches are REVOKE'd from PUBLIC at
     -- definition; grant them to the superuser role only.
     IF superuser_role != '' THEN
+        -- DDL creates inlined data tables in the ducklake schema.
+        EXECUTE format('GRANT CREATE ON SCHEMA ducklake TO %I', superuser_role);
         EXECUTE format('GRANT EXECUTE ON FUNCTION ducklake.query(text) TO %I', superuser_role);
         EXECUTE format('GRANT EXECUTE ON FUNCTION ducklake.raw_query(text) TO %I', superuser_role);
     END IF;

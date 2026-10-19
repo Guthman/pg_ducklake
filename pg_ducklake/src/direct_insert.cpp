@@ -5,6 +5,7 @@
 #include "pgducklake/direct_insert.hpp"
 #include "pgducklake/duckdb_manager.hpp"
 #include "pgducklake/guc.hpp"
+#include "pgducklake/inline_col_stats.hpp"
 #include "pgducklake/pgducklake_metadata_manager.hpp"
 
 #include <cstring>
@@ -70,6 +71,7 @@ struct InliningInfoCache {
 
 struct InlinedColumnTypesCache {
 	List *col_types; // List of Oid, palloc'd in TopMemoryContext
+	bool has_unbounded_column;
 };
 
 static std::unordered_map<Oid, InliningInfoCache> inlining_info_cache;
@@ -112,6 +114,7 @@ struct DirectInsertScanState {
 	uint64_t table_id;
 	uint64_t schema_version;
 	char *inlined_table_name;
+	pgducklake::InlineColStats *col_stats;
 	List *column_names; // List of String nodes
 	List *column_types; // List of Oid (inlined table types)
 
@@ -242,8 +245,15 @@ DuckDBTypeToInlinedOid(const char *duckdb_type, Oid element_type) {
  * ducklake_column metadata.  element_types is the user-facing PG type per
  * column (List of Oid).  Returns false on bail-out.
  */
+/* Types whose table column stats a direct insert cannot keep (no safe min/max). */
 static bool
-GetInlinedColumnTypes(uint64_t table_id, List *element_types, List **inlined_col_types_out) {
+HasUnboundedStats(const char *duckdb_type) {
+	return pg_strcasecmp(duckdb_type, "BLOB") == 0 || pg_strcasecmp(duckdb_type, "INTERVAL") == 0 ||
+	       pg_strcasecmp(duckdb_type, "TIMETZ") == 0;
+}
+
+static bool
+GetInlinedColumnTypes(uint64_t table_id, List *element_types, List **inlined_col_types_out, bool *unbounded_out) {
 	int ret;
 	int num_cols = list_length(element_types);
 
@@ -290,6 +300,7 @@ ORDER BY column_order)",
 
 		Oid element_type = lfirst_oid(lc);
 		Oid inlined_oid = DuckDBTypeToInlinedOid(duckdb_type, element_type);
+		*unbounded_out = *unbounded_out || HasUnboundedStats(duckdb_type);
 		pfree(duckdb_type);
 
 		if (!OidIsValid(inlined_oid)) {
@@ -408,16 +419,18 @@ CheckInsertPreconditions(Query *parse, InsertPreconditionResult *result_out, Dir
  */
 static bool
 GetCachedInlinedColumnTypes(uint64_t table_id, uint64_t schema_version, List *element_types,
-                            List **inlined_col_types_out) {
+                            List **inlined_col_types_out, bool *has_unbounded_out) {
 	TableSchemaKey col_key = {table_id, schema_version};
 	auto col_cache_it = inlined_col_types_cache.find(col_key);
 	if (col_cache_it != inlined_col_types_cache.end()) {
 		*inlined_col_types_out = col_cache_it->second.col_types;
+		*has_unbounded_out = col_cache_it->second.has_unbounded_column;
 		return true;
 	}
 
 	List *inlined_col_types = NIL;
-	if (!GetInlinedColumnTypes(table_id, element_types, &inlined_col_types)) {
+	bool has_unbounded = false;
+	if (!GetInlinedColumnTypes(table_id, element_types, &inlined_col_types, &has_unbounded)) {
 		return false;
 	}
 
@@ -428,8 +441,9 @@ GetCachedInlinedColumnTypes(uint64_t table_id, uint64_t schema_version, List *el
 		persistent = lappend_oid(persistent, lfirst_oid(lc_oid));
 	}
 	MemoryContextSwitchTo(old_ctx);
-	inlined_col_types_cache[col_key] = {persistent};
+	inlined_col_types_cache[col_key] = {persistent, has_unbounded};
 	*inlined_col_types_out = persistent;
+	*has_unbounded_out = has_unbounded;
 	return true;
 }
 
@@ -608,7 +622,10 @@ TryMatchUnnest(Query *parse, ParamListInfo bound_params, const InsertPreconditio
 	}
 
 	List *inlined_col_types = NIL;
-	if (!GetCachedInlinedColumnTypes(precond->table_id, precond->schema_version, element_types, &inlined_col_types)) {
+	/* UNNEST($n) has no DuckDB fallback, so it keeps writing unbounded types; their stats stay unknown. */
+	bool has_unbounded;
+	if (!GetCachedInlinedColumnTypes(precond->table_id, precond->schema_version, element_types, &inlined_col_types,
+	                                 &has_unbounded)) {
 		*reason_out = DI_R_COL_TYPES_UNSUPPORTED;
 		return false;
 	}
@@ -954,7 +971,11 @@ TryMatchValues(Query *parse, const InsertPreconditionResult *precond, ValuesInse
 	}
 
 	List *inlined_col_types = NIL;
-	if (!GetCachedInlinedColumnTypes(precond->table_id, precond->schema_version, src_col_types, &inlined_col_types)) {
+	/* Unbounded types go to the DuckDB writer, which keeps their stats. */
+	bool has_unbounded;
+	if (!GetCachedInlinedColumnTypes(precond->table_id, precond->schema_version, src_col_types, &inlined_col_types,
+	                                 &has_unbounded) ||
+	    has_unbounded) {
 		pfree(exprs);
 		*reason_out = DI_R_COL_TYPES_UNSUPPORTED;
 		return false;
@@ -1219,7 +1240,8 @@ DirectInsert_ExecCustomScan(CustomScanState *node) {
 		}
 
 		pgducklake::SkipSnapshotSyncGuard sync_guard;
-		pgducklake::CreateSnapshotForDirectInsert(state->begin_snapshot, state->table_id, state->rows_inserted);
+		pgducklake::CreateSnapshotForDirectInsert(state->begin_snapshot, state->table_id, state->rows_inserted,
+		                                          state->col_stats);
 	}
 	PG_CATCH();
 	{
@@ -1376,6 +1398,9 @@ DirectInsertIntoInlinedTable(DirectInsertScanState *state) {
 		}
 	}
 
+	state->col_stats =
+	    pgducklake::BeginInlineColStats(state->table_id, state->inlined_table_name, num_params, element_types);
+
 	uint64_t current_row_id = state->next_row_id;
 
 	for (int row = 0; row < arr_length; row++) {
@@ -1383,6 +1408,7 @@ DirectInsertIntoInlinedTable(DirectInsertScanState *state) {
 		values[1] = Int64GetDatum(state->begin_snapshot);
 
 		for (int i = 0; i < num_params; i++) {
+			pgducklake::ObserveInlineColStats(state->col_stats, i, elem_values[i][row], elem_nulls[i][row]);
 			if (elem_nulls[i][row]) {
 				values[i + 2] = (Datum)0;
 				nulls[i + 2] = 'n';
@@ -1507,6 +1533,9 @@ DirectInsertValuesIntoInlinedTable(DirectInsertScanState *state) {
 		DateOrder = DATEORDER_YMD;
 	}
 
+	state->col_stats =
+	    pgducklake::BeginInlineColStats(state->table_id, state->inlined_table_name, num_cols, state->values_src_types);
+
 	int batch_size = (num_rows < MAX_BUFFERED_TUPLES) ? num_rows : MAX_BUFFERED_TUPLES;
 	TupleTableSlot **slots = (TupleTableSlot **)palloc(sizeof(TupleTableSlot *) * batch_size);
 	for (int i = 0; i < batch_size; i++) {
@@ -1541,6 +1570,7 @@ DirectInsertValuesIntoInlinedTable(DirectInsertScanState *state) {
 
 			bool isnull;
 			Datum d = ExecEvalExprSwitchContext(state->values_estates[flat], econtext, &isnull);
+			pgducklake::ObserveInlineColStats(state->col_stats, col, d, isnull);
 
 			if (isnull) {
 				sv[dst] = (Datum)0;

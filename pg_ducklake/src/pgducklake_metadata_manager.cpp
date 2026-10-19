@@ -4,6 +4,7 @@
 #include "pgducklake/constants.hpp"
 #include "pgducklake/duckdb_manager.hpp"
 #include "pgducklake/guc.hpp"
+#include "pgducklake/inline_col_stats.hpp"
 #include "pgducklake/pgducklake_metadata_manager.hpp"
 
 #include <cstring>
@@ -744,7 +745,8 @@ GetNextSnapshotId() {
 }
 
 void
-CreateSnapshotForDirectInsert(uint64_t snapshot_id, uint64_t table_id, int64_t rows_inserted) {
+CreateSnapshotForDirectInsert(uint64_t snapshot_id, uint64_t table_id, int64_t rows_inserted,
+                              InlineColStats *col_stats) {
 	int ret;
 
 	elog(DEBUG1, "CreateSnapshotForDirectInsert: creating snapshot %llu", (unsigned long long)snapshot_id);
@@ -839,7 +841,8 @@ CreateSnapshotForDirectInsert(uint64_t snapshot_id, uint64_t table_id, int64_t r
 		elog(ERROR, "CreateSnapshotForDirectInsert: failed to update table stats: %d", ret);
 	}
 
-	if (SPI_processed == 0) {
+	bool initializing = SPI_processed == 0;
+	if (initializing) {
 		StringInfoData stats_insert;
 		initStringInfo(&stats_insert);
 		appendStringInfo(&stats_insert,
@@ -871,24 +874,8 @@ CreateSnapshotForDirectInsert(uint64_t snapshot_id, uint64_t table_id, int64_t r
 
 		elog(DEBUG1, "CreateSnapshotForDirectInsert: created new stats row for table %llu",
 		     (unsigned long long)table_id);
-	} else {
-		/* Degrade column stats to unknown: the fast path does not compute
-		 * min/max/null flags, and stale claims would let DuckLake readers
-		 * prune rows this insert just added. */
-		StringInfoData col_stats_degrade;
-		initStringInfo(&col_stats_degrade);
-		appendStringInfo(&col_stats_degrade,
-		                 "UPDATE ducklake.ducklake_table_column_stats "
-		                 "SET contains_null = NULL, contains_nan = NULL, "
-		                 "min_value = NULL, max_value = NULL, extra_stats = NULL "
-		                 "WHERE table_id = %llu",
-		                 (unsigned long long)table_id);
-
-		ret = SPI_execute(col_stats_degrade.data, false, 0);
-		if (ret != SPI_OK_UPDATE) {
-			elog(ERROR, "CreateSnapshotForDirectInsert: failed to degrade column stats: %d", ret);
-		}
 	}
+	MergeInlineColStats(col_stats, table_id, initializing);
 
 	SPI_finish();
 	elog(DEBUG1, "CreateSnapshotForDirectInsert: successfully created snapshot %llu", (unsigned long long)snapshot_id);

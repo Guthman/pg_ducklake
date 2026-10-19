@@ -21,6 +21,7 @@ extern "C" {
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "catalog/heap.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -378,6 +379,93 @@ QueryReferencesDucklakeOnlyFunc(Node *node, void *context) {
 #endif
 }
 
+static bool
+FindSystemColumn(Node *node, void *context) {
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Var) && castNode(Var, node)->varattno < 0) {
+		*(Var **)context = castNode(Var, node);
+		return true;
+	}
+
+	if (IsA(node, Query)) {
+#if PG_VERSION_NUM >= 160000
+		return query_tree_walker((Query *)node, FindSystemColumn, context, 0);
+#else
+		return query_tree_walker((Query *)node, (bool (*)())((void *)FindSystemColumn), context, 0);
+#endif
+	}
+
+#if PG_VERSION_NUM >= 160000
+	return expression_tree_walker(node, FindSystemColumn, context);
+#else
+	return expression_tree_walker(node, (bool (*)())((void *)FindSystemColumn), context);
+#endif
+}
+
+/* DuckDB has no system columns: plain SELECT outputs of DuckLake tables' system
+ * columns are computed by a Result node above the DuckDB scan (NULL, or the
+ * relation OID for tableoid); any other use is rejected. */
+static PlannedStmt *
+PlanDuckDBQuery(Query *parse, int cursor_options) {
+	List *pg_outputs = NIL;
+	bool has_pg_outputs = false;
+
+	if (parse->commandType == CMD_SELECT) {
+		foreach_node(TargetEntry, tle, parse->targetList) {
+			if (tle->resjunk)
+				continue;
+
+			Expr *pg_output = NULL;
+			Var *var = IsA(tle->expr, Var) ? castNode(Var, tle->expr) : NULL;
+			RangeTblEntry *rte = var ? rt_fetch(var->varno, parse->rtable) : NULL;
+			if (var && var->varattno < 0 && tle->ressortgroupref == 0 && rte->rtekind == RTE_RELATION &&
+			    pgddb::TableAmGetName(rte->relid) != nullptr) {
+				if (var->varattno == TableOidAttributeNumber)
+					pg_output = (Expr *)makeConst(OIDOID, -1, InvalidOid, sizeof(Oid), ObjectIdGetDatum(rte->relid),
+					                              false, true);
+				else
+					pg_output = (Expr *)makeNullConst(var->vartype, var->vartypmod, var->varcollid);
+				tle->expr = (Expr *)makeNullConst(INT4OID, -1, InvalidOid);
+				has_pg_outputs = true;
+			}
+			pg_outputs = lappend(pg_outputs, pg_output);
+		}
+	}
+
+	Var *sys_var = NULL;
+	if (FindSystemColumn((Node *)parse, &sys_var))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+		                errmsg("system column \"%s\" is not supported in queries on DuckLake tables",
+		                       NameStr(SystemAttributeDefinition(sys_var->varattno)->attname))));
+
+	PlannedStmt *stmt = pgddb::PlanNode(parse, cursor_options, /*throw_error=*/true);
+	if (!has_pg_outputs)
+		return stmt;
+
+	Plan *duckdb_plan = stmt->planTree;
+	List *tlist = NIL;
+	int i = 0;
+	foreach_node(TargetEntry, duckdb_tle, duckdb_plan->targetlist) {
+		Expr *expr = (Expr *)list_nth(pg_outputs, i);
+		if (expr == NULL) {
+			Var *var = (Var *)copyObjectImpl(duckdb_tle->expr);
+			var->varno = OUTER_VAR;
+			var->varattno = i + 1;
+			expr = (Expr *)var;
+		}
+		tlist = lappend(tlist, makeTargetEntry(expr, i + 1, duckdb_tle->resname, false));
+		i++;
+	}
+
+	Result *result = makeNode(Result);
+	result->plan.targetlist = tlist;
+	result->plan.lefttree = duckdb_plan;
+	stmt->planTree = (Plan *)result;
+	return stmt;
+}
+
 static PlannedStmt *
 #if PG_VERSION_NUM >= 190000
 DucklakePlannerHook(Query *parse, const char *query_string, int cursor_options, ParamListInfo bound_params,
@@ -417,7 +505,7 @@ DucklakePlannerHook(Query *parse, const char *query_string, int cursor_options, 
 		if (parse->commandType != CMD_SELECT &&
 		    pgddb::IsPostgresTable(rt_fetch(parse->resultRelation, parse->rtable)->relid))
 			pgddb::IsAllowedPostgresInsert(parse, /*throw_error=*/true);
-		return pgddb::PlanNode(parse, cursor_options, /*throw_error=*/true);
+		return PlanDuckDBQuery(parse, cursor_options);
 	}
 
 #if PG_VERSION_NUM >= 190000

@@ -3,7 +3,9 @@ test: recycle_ddb
 test: ddl_triggers
 test: basic
 test: virtual_columns
+test: system_columns
 test: dml_row_count
+test: auto_explain
 test: merge
 test: truncate
 test: transaction
@@ -32,11 +34,13 @@ test: inlined_flush_lost_update
 test: types
 test: unresolved_type_ops
 test: decimal_precision
+test: stats_comparison
 test: variant
 test: readme_examples
 test: ddl
 test: vacuum
 test: maintenance
+test: maintenance_cleanup_retention
 test: commit_message
 test: partition
 test: partition_transform_flush

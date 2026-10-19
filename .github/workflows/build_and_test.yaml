@@ -110,7 +110,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: postgres/inst
-          key: pg-build-ubuntu-24.04-${{ matrix.version }}-${{ steps.versions.outputs.postgres_sha }}
+          key: pg-build-ubuntu-24.04-${{ matrix.version }}-${{ steps.versions.outputs.postgres_sha }}-auto_explain
 
       - &build_pg
         name: Build PostgreSQL
@@ -120,6 +120,7 @@ jobs:
             ./configure --prefix=$PWD/inst --enable-cassert --enable-debug \
               --with-openssl --with-icu --with-libxml --with-lz4
             make -j$(nproc) install
+            make -C contrib/auto_explain install
           fi
           echo "$PWD/inst/bin" >> "$GITHUB_PATH"
 
@@ -236,6 +237,10 @@ jobs:
         run: make pg_ducklake/all -j$(nproc)
       - name: Install pg_ducklake
         run: make pg_ducklake/install
+      # Kernel calls must not resolve through the PLT, where a kernel copy in
+      # another loaded extension could interpose.
+      - name: Check kernel symbols bind locally
+        run: "! readelf -rW pg_ducklake/pg_ducklake.so | grep -E 'JUMP_SLOT.*Register_'"
 
       - name: pg_ducklake installcheck
         id: pgducklake_installcheck
@@ -343,7 +348,7 @@ jobs:
         with:
           path: postgres/inst
           # Same key as build-and-test so the PG build is shared.
-          key: pg-build-ubuntu-24.04-${{ env.PG_VERSION }}-${{ steps.versions.outputs.postgres_sha }}
+          key: pg-build-ubuntu-24.04-${{ env.PG_VERSION }}-${{ steps.versions.outputs.postgres_sha }}-auto_explain
 
       - name: Build PostgreSQL
         if: steps.cache-pg.outputs.cache-hit != 'true'
@@ -352,6 +357,7 @@ jobs:
           ./configure --prefix=$PWD/inst --enable-cassert --enable-debug \
             --with-openssl --with-icu --with-libxml --with-lz4
           make -j$(nproc) install
+          make -C contrib/auto_explain install
 
       - name: Add PG to PATH
         run: echo "${PWD}/postgres/inst/bin" >> "$GITHUB_PATH"

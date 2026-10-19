@@ -6,7 +6,7 @@ INSERT INTO upstream_tx_boolean VALUES (false);
 SELECT count(*) FROM upstream_tx_boolean WHERE active = false;
  count 
 -------
-     0
+     1
 (1 row)
 
 CREATE TABLE upstream_tx_null_update (id bigint, tag text) USING ducklake;

@@ -21,6 +21,7 @@ Use `SELECT * FROM ducklake.options()` to list all DuckLake catalog options and 
 | [`ducklake.maintenance_flush_inlined_data`](#ducklakemaintenance_flush_inlined_data) | `true` | Reload (`SIGHUP`) |
 | [`ducklake.maintenance_max_workers`](#ducklakemaintenance_max_workers) | `3` | Requires restart |
 | [`ducklake.maintenance_naptime`](#ducklakemaintenance_naptime) | `60` | Reload (`SIGHUP`) |
+| [`ducklake.max_worker_sessions`](#ducklakemax_worker_sessions) | `8` | Reload (`SIGHUP`) |
 | [`ducklake.native_writer_max_retry_count`](#ducklakenative_writer_retry_settings) | `10` | Per-session |
 | [`ducklake.native_writer_reservation_queue`](#ducklakenative_writer_reservation_queue) | `true` | Per-session |
 | [`ducklake.native_writer_reservation_queue_capacity`](#ducklakenative_writer_reservation_queue_capacity) | `256` | Requires restart; superuser only |
@@ -30,7 +31,11 @@ Use `SELECT * FROM ducklake.options()` to list all DuckLake catalog options and 
 | [`ducklake.reader_role`](#ducklakereader_role) | `"ducklake_reader"` | Requires restart |
 | [`ducklake.superuser_role`](#ducklakesuperuser_role) | `"ducklake_superuser"` | Requires restart |
 | [`ducklake.test_native_writer_fault`](#ducklaketest_native_writer_fault) | `off` | Superuser by default; test use |
+| [`ducklake.use_shared_worker`](#ducklakeuse_shared_worker) | `false` | Per-session |
 | [`ducklake.vacuum_delete_threshold`](#ducklakevacuum_delete_threshold) | `0.1` | Per-session |
+| [`ducklake.worker_memory_limit`](#ducklakeworker_memory_limit) | `0` | Reload (`SIGHUP`) |
+| [`ducklake.worker_temp_directory`](#ducklakeworker_temp_directory) | `""` | Reload (`SIGHUP`) |
+| [`ducklake.worker_threads`](#ducklakeworker_threads) | `-1` | Reload (`SIGHUP`) |
 | [`ducklake.writer_role`](#ducklakewriter_role) | `"ducklake_writer"` | Requires restart |
 
 ## DuckLake Catalog Options
@@ -244,6 +249,43 @@ Role with SELECT-only access to DuckLake tables. Created during `CREATE EXTENSIO
 - **Access**: Requires restart (superuser-only)
 
 See [access_control.md](access_control.md) for role usage details.
+
+### `ducklake.use_shared_worker`
+
+Run eligible read-only queries in the shared per-database DuckDB worker instead of this backend's own DuckDB instance. See [shared_worker.md](shared_worker.md) for what is dispatched and what stays in-process.
+
+- **Default**: `false`
+- **Access**: Per-session
+
+### `ducklake.max_worker_sessions`
+
+Maximum number of dispatched queries the shared worker runs concurrently. Further dispatches wait for a free session.
+
+- **Default**: `8`
+- **Range**: 1 -- 1024
+- **Access**: Reload (`SIGHUP`)
+
+### `ducklake.worker_threads`
+
+Number of DuckDB threads of the shared worker's engine; `-1` uses DuckDB's default (all cores). Applied when the worker starts.
+
+- **Default**: `-1`
+- **Range**: -1 -- 1024
+- **Access**: Reload (`SIGHUP`)
+
+### `ducklake.worker_memory_limit`
+
+Memory limit of the shared worker's DuckDB engine, in megabytes; `0` keeps DuckDB's default (80% of RAM). Applied when the worker starts.
+
+- **Default**: `0`
+- **Access**: Reload (`SIGHUP`)
+
+### `ducklake.worker_temp_directory`
+
+DuckDB temp directory of the shared worker's engine, so it can spill to disk under its memory limit. Empty disables spilling. Applied when the worker starts.
+
+- **Default**: `""` (empty string)
+- **Access**: Reload (`SIGHUP`)
 
 ### DuckLake Catalog Options
 

@@ -144,11 +144,13 @@ DecodeFrameTag(const char *data, size_t len) {
 	switch (tag) {
 	case FrameTag::QUERY:
 	case FrameTag::RPC_REPLY:
+	case FrameTag::CHUNK_FREE:
 	case FrameTag::SCHEMA:
 	case FrameTag::CHUNK:
 	case FrameTag::DONE:
 	case FrameTag::QUERY_ERROR:
 	case FrameTag::RPC:
+	case FrameTag::CHUNK_REF:
 		return tag;
 	}
 	throw duckdb::SerializationException("Failed to deserialize frame: unknown tag %d", static_cast<int>(tag));

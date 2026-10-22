@@ -66,6 +66,23 @@ EXECUTE sw_p(997, 'row999');
 EXECUTE sw_p(997, NULL);
 SELECT sw_total() - :before AS dispatched;
 
+-- Dispatches nest: the loop's query holds a session while each inner query
+-- opens another one on the same worker and arena.
+SELECT sw_total() AS before \gset
+DO $$
+DECLARE
+	r record;
+	n bigint;
+	total bigint := 0;
+BEGIN
+	FOR r IN SELECT i FROM sw_t WHERE i <= 3 ORDER BY i LOOP
+		SELECT count(*) INTO n FROM sw_small WHERE i = r.i;
+		total := total + n;
+	END LOOP;
+	RAISE NOTICE 'matched %', total;
+END $$;
+SELECT sw_total() - :before AS dispatched;
+
 -- Session settings travel with the query (in-process DuckDB keeps the
 -- TimeZone it was initialized with, so only the worker follows the SET).
 SET TimeZone = 'Asia/Tokyo';
@@ -96,6 +113,21 @@ END $$;
 SELECT count(*) FROM sw_t;
 SELECT worker_pid IS NOT NULL AS has_worker FROM ducklake.worker_stats();
 
+-- Result pages: regression.conf sets 64kB arena pages, so these rows span
+-- several pages; a row larger than a page and a nested type travel serialized.
+CREATE TABLE sw_wide (i int, s text, l int[]) USING ducklake;
+INSERT INTO sw_wide SELECT g, repeat('x', 1000), ARRAY[g, g + 1] FROM generate_series(1, 500) g;
+INSERT INTO sw_wide VALUES (0, repeat('y', 200000), ARRAY[0]);
+SET ducklake.use_shared_worker = off;
+SELECT count(*), sum(length(s)), min(i), max(i) FROM sw_wide;
+SELECT i, length(s), left(s, 3) FROM sw_wide WHERE i IN (0, 1, 500) ORDER BY i;
+SELECT i, l FROM sw_wide WHERE i <= 2 ORDER BY i;
+SET ducklake.use_shared_worker = on;
+SELECT count(*), sum(length(s)), min(i), max(i) FROM sw_wide;
+SELECT i, length(s), left(s, 3) FROM sw_wide WHERE i IN (0, 1, 500) ORDER BY i;
+SELECT i, l FROM sw_wide WHERE i <= 2 ORDER BY i;
+SELECT count(*) FROM (SELECT s FROM sw_wide WHERE i > 0) x;
+
 RESET ducklake.use_shared_worker;
 DROP FUNCTION sw_total();
-DROP TABLE sw_t, sw_small, sw_heap;
+DROP TABLE sw_t, sw_small, sw_heap, sw_wide;

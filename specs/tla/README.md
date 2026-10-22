@@ -71,7 +71,7 @@ loop resets it before scanning.
 | `NeedMeta`, `MetaReturn` | `WorkerSessionRequest` |
 | `Interrupted` | the session thread unwinding after `Interrupt()` |
 | `MainWake`, `MainScanEmpty`, `MainSleep` | the `WaitLatch` / `ResetLatch` loop in `WorkerMainLoop` |
-| `Send`, `Recv`, `ObserveDetach`, `Reap` | `PumpSession`, `DetachSession`, `ReapSessions` |
+| `Send`, `Recv`, `ObserveDetach`, `Reap` | `PumpSession` (RPC replies and `CHUNK_FREE` both arrive on the request ring), `DetachSession`, `ReapSessions` |
 | `Pull`, `Reply`, `FinishDetach`, `Abort` | `BackendSession::ReceiveOne`, `ServeRequest`, `Release` |
 
 Invariants: queues stay bounded, at most one RPC per session is in flight
@@ -89,6 +89,34 @@ backend keeps pulling is served and reaped whatever the other backends do.
 | `WorkerPump_blockingsend_bug.cfg` (`NonBlockingSend = FALSE`) | `FairSessionsExit` violated: a stalled backend starves the other session |
 | `WorkerPump_lostwakeup_bug.cfg` (`ResetLatchFirst = FALSE`) | `NoLostWakeup` violated |
 | `WorkerPump_metahang_bug.cfg` (`FailMetaOnDetach = FALSE`) | deadlock: a session waits forever for a reply its backend never sends |
+
+## SharedArena.tla: the result page arena
+
+One arena of result pages shared by every session of a worker. A session
+thread takes a page to write a chunk, the backend consumes the chunk and
+frees the page, and a stalled backend keeps its pages forever. Each session
+owns `ReservedPages` pages that are never lent to another session; the rest
+is a shared overflow.
+
+| Action | Code |
+|---|---|
+| `Produce`, `Block`, `Unblock` | `AcquirePage` and the arena condition variable |
+| `Pull`, `Done` | `BackendSession::ReceiveOne` on `CHUNK_REF`, `FreeHeldPage` at the top of `Fetch` |
+| `BackendFinish`, `Abort` | `Release`, `ReclaimPages` after the thread is joined |
+
+Invariants: every page is free or held by exactly one session
+(`PageConservation`). Liveness: a session whose
+backend keeps consuming always completes, whatever the other backends hold.
+Two orderings in the code carry the model's guarantees: the backend frees
+the page of a consumed chunk before it waits for the next frame, and the
+worker reclaims a session's pages only after the backend freed them or
+detached (`SessionFinished`), never while the backend may still read one.
+
+| Config | Expected |
+|---|---|
+| `SharedArena.cfg` (two reserved pages per session, one overflow page, one backend may stall forever) | pass |
+| `SharedArena_noreserve_bug.cfg` (one pooled arena, no reservation) | `FairSessionsComplete` violated: the stalled session's pages starve the other |
+| `SharedArena_freeafterwait_bug.cfg` (the backend frees a page only when the next chunk arrives) | `FairSessionsComplete` violated: producer and consumer wait for each other |
 
 ## What the models found while the design was written
 

@@ -47,10 +47,23 @@ Everything else behaves exactly as with `ducklake.use_shared_worker = off`.
 | [`ducklake.worker_threads`](settings.md#ducklakeworker_threads) | DuckDB threads of the worker's engine |
 | [`ducklake.worker_memory_limit`](settings.md#ducklakeworker_memory_limit) | Memory limit of the worker's engine |
 | [`ducklake.worker_temp_directory`](settings.md#ducklakeworker_temp_directory) | Spill directory for the worker's engine |
+| [`ducklake.worker_page_size`](settings.md#ducklakeworker_page_size) | Size of one result page |
+| [`ducklake.worker_arena_pages`](settings.md#ducklakeworker_arena_pages) | Result pages shared by all dispatched queries |
+| [`ducklake.worker_reserved_pages`](settings.md#ducklakeworker_reserved_pages) | Pages reserved for each dispatched query |
 
 The engine settings are read when the worker starts; after changing them,
 terminate the worker (`pg_terminate_backend()` on its pid) and the next
 dispatch starts a fresh one.
+
+Results travel through a page arena in shared memory: the worker writes each
+result chunk into a page once and the backend reads it in place. The arena
+is shared by every dispatched query of the database, so `worker_arena_pages`
+times `worker_page_size` bounds the memory results in flight can take, and a
+query whose backend consumes slowly waits for pages instead of buffering.
+Each query is admitted only once `worker_reserved_pages` pages are free for
+it and always makes progress on them, so a stalled client never blocks the
+others; the remaining pages are a shared overflow. Nested result types and
+rows larger than a page are sent through the message queue instead.
 
 ## Observing dispatch
 

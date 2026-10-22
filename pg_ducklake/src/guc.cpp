@@ -57,6 +57,9 @@ int max_worker_sessions = 8;
 int worker_threads = -1;
 int worker_memory_limit = 0;
 char *worker_temp_directory = strdup("");
+int worker_page_size = 1024;
+int worker_arena_pages = 64;
+int worker_reserved_pages = 1;
 
 void
 InitGUCs() {
@@ -201,6 +204,21 @@ InitGUCs() {
 	                           "memory limit (empty = no spilling).",
 	                           "Applied when the worker starts.", &worker_temp_directory, "", PGC_SIGHUP, 0, NULL, NULL,
 	                           NULL);
+
+	DefineCustomIntVariable("ducklake.worker_page_size", "Size of one result page of the shared worker's arena.",
+	                        "Result chunks are written into arena pages and read in place by the dispatching "
+	                        "backend. Applied when the worker starts.",
+	                        &worker_page_size, 1024, 64, 1024 * 1024, PGC_SIGHUP, GUC_UNIT_KB, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("ducklake.worker_arena_pages", "Number of result pages in the shared worker's arena.",
+	                        "Bounds the memory results in flight can take; sessions that outrun their backends wait "
+	                        "for a page. Applied when the worker starts.",
+	                        &worker_arena_pages, 64, 1, 1024 * 1024, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("ducklake.worker_reserved_pages", "Arena pages reserved for each dispatched query.",
+	                        "A query is admitted only once its reserved pages are free and always makes progress on "
+	                        "them; the remaining pages are a shared overflow.",
+	                        &worker_reserved_pages, 1, 1, 1024, PGC_SIGHUP, 0, NULL, NULL, NULL);
 }
 
 } // namespace pgducklake

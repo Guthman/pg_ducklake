@@ -37,7 +37,9 @@ public:
 	// Result column types; blocks until the worker reports them.
 	virtual const duckdb::vector<duckdb::LogicalType> &Types() = 0;
 	// Next chunk, or nullptr once the result is complete. A worker-side failure
-	// is rethrown as a duckdb exception of the same type.
+	// is rethrown as a duckdb exception of the same type. The chunk references
+	// memory owned by the result: it dies at the next Fetch or when the result
+	// is destroyed.
 	virtual duckdb::unique_ptr<duckdb::DataChunk> Fetch() = 0;
 };
 
@@ -48,6 +50,12 @@ public:
 		const char *library_name;  // bgw_library_name
 		const char *function_name; // bgw_function_name; that function calls Main()
 		int *max_sessions;         // worker capacity, read each time a session is admitted
+		// Result page arena, read when the worker starts: page size in kB, total
+		// pages, and pages reserved for each admitted session (the rest is a
+		// shared overflow). Admission also waits for the reserved pages.
+		int *page_size_kb;
+		int *arena_pages;
+		int *reserved_pages;
 	};
 
 	explicit DuckdbWorker(Settings settings);

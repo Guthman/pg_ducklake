@@ -47,5 +47,8 @@ extern int max_worker_sessions;
 extern int worker_threads;
 extern int worker_memory_limit;
 extern char *worker_temp_directory;
+extern int worker_page_size;
+extern int worker_arena_pages;
+extern int worker_reserved_pages;
 
 } // namespace pgducklake

@@ -56,8 +56,8 @@ CleanupDuckdbScanState(DuckdbScanState *state) {
 	ExecClearTuple(state->css.ss.ss_ScanTupleSlot);
 
 	state->query_results.reset();
+	state->current_data_chunk.reset(); // may reference the remote result's memory
 	state->remote_result.reset();
-	state->current_data_chunk.reset();
 
 	if (state->prepared_statement) {
 		delete state->prepared_statement;

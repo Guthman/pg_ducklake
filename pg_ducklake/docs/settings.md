@@ -33,7 +33,10 @@ Use `SELECT * FROM ducklake.options()` to list all DuckLake catalog options and 
 | [`ducklake.test_native_writer_fault`](#ducklaketest_native_writer_fault) | `off` | Superuser by default; test use |
 | [`ducklake.use_shared_worker`](#ducklakeuse_shared_worker) | `false` | Per-session |
 | [`ducklake.vacuum_delete_threshold`](#ducklakevacuum_delete_threshold) | `0.1` | Per-session |
+| [`ducklake.worker_arena_pages`](#ducklakeworker_arena_pages) | `64` | Reload (`SIGHUP`) |
 | [`ducklake.worker_memory_limit`](#ducklakeworker_memory_limit) | `0` | Reload (`SIGHUP`) |
+| [`ducklake.worker_page_size`](#ducklakeworker_page_size) | `1MB` | Reload (`SIGHUP`) |
+| [`ducklake.worker_reserved_pages`](#ducklakeworker_reserved_pages) | `1` | Reload (`SIGHUP`) |
 | [`ducklake.worker_temp_directory`](#ducklakeworker_temp_directory) | `""` | Reload (`SIGHUP`) |
 | [`ducklake.worker_threads`](#ducklakeworker_threads) | `-1` | Reload (`SIGHUP`) |
 | [`ducklake.writer_role`](#ducklakewriter_role) | `"ducklake_writer"` | Requires restart |
@@ -285,6 +288,28 @@ Memory limit of the shared worker's DuckDB engine, in megabytes; `0` keeps DuckD
 DuckDB temp directory of the shared worker's engine, so it can spill to disk under its memory limit. Empty disables spilling. Applied when the worker starts.
 
 - **Default**: `""` (empty string)
+- **Access**: Reload (`SIGHUP`)
+
+### `ducklake.worker_page_size`
+
+Size of one result page of the shared worker's arena. The worker writes each result chunk into a page and the dispatching backend reads it in place; a chunk that does not fit is split across pages, and a single row larger than a page is sent through the message queue instead. Applied when the worker starts.
+
+- **Default**: `1MB`
+- **Range**: `64kB` to `1GB`
+- **Access**: Reload (`SIGHUP`)
+
+### `ducklake.worker_arena_pages`
+
+Number of result pages in the shared worker's arena, shared by every dispatched query of the database. Together with `ducklake.worker_page_size` it bounds the memory that results in flight can take; a query whose backend consumes slowly waits for a page instead of buffering. Applied when the worker starts.
+
+- **Default**: `64`
+- **Access**: Reload (`SIGHUP`)
+
+### `ducklake.worker_reserved_pages`
+
+Arena pages reserved for each dispatched query. A query is admitted only once that many pages are free for it, and it always makes progress on them, so a client that stops reading its result never blocks the other queries; the remaining pages of the arena are a shared overflow. Read each time a query is admitted.
+
+- **Default**: `1`
 - **Access**: Reload (`SIGHUP`)
 
 ### DuckLake Catalog Options

@@ -1,6 +1,7 @@
 #include "pgddb/worker/duckdb_worker.hpp"
 #include "pgddb/worker/worker_protocol.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <csignal>
@@ -101,6 +102,7 @@ struct WorkerEntry {
 	pid_t starter_pid; // backend that claimed the entry while WORKER_STARTING
 	uint32 claim;      // identifies the spawn this claim belongs to
 	Latch *latch;
+	dsm_handle arena_handle; // the worker's result page arena
 	int active_sessions;
 	uint64 total_sessions;
 	uint32 mailbox_head;
@@ -124,6 +126,17 @@ struct SessionHeader {
 constexpr Size REQUEST_OFFSET = MAXALIGN(sizeof(SessionHeader));
 constexpr Size RESPONSE_OFFSET = REQUEST_OFFSET + REQUEST_RING;
 constexpr Size SEGMENT_SIZE = RESPONSE_OFFSET + RESPONSE_RING;
+
+// Result page arena: one dsm segment per worker, shared by all its sessions.
+// The worker owns the page accounting; backends only read pages and report
+// them free.
+struct ArenaHeader {
+	uint32 page_size;
+	uint32 page_count;
+};
+
+constexpr Size ARENA_PAGES_OFFSET = 64;
+constexpr uint32 NO_PAGE = UINT32_MAX;
 
 WorkerShmem *g_shmem = nullptr;
 DuckdbWorker *g_worker = nullptr;
@@ -206,6 +219,16 @@ private:
 	bool WorkerAttached();
 	// Receives one frame; returns a chunk, or nullptr for SCHEMA/RPC/DONE.
 	duckdb::unique_ptr<duckdb::DataChunk> ReceiveOne(bool &received);
+	// Reports the page of the chunk just consumed; must run before any wait.
+	void FreeHeldPage();
+
+	dsm_handle arena_handle_ = 0;
+	dsm_segment *arena_seg_ = nullptr;
+	char *arena_base_ = nullptr;
+	uint32 arena_page_size_ = 0;
+	uint32 arena_page_count_ = 0;
+	uint32 held_page_ = NO_PAGE;
+	duckdb::vector<duckdb::unsafe_unique_array<duckdb::string_t>> strings_;
 
 	DuckdbWorker &worker_;
 	Oid dboid_;
@@ -226,6 +249,43 @@ namespace {
 
 std::vector<BackendSession *> g_backend_sessions;
 bool g_backend_exit_hook = false;
+
+// Arena mappings are shared by this backend's sessions: dsm_attach refuses to
+// map a handle twice, and dispatches nest (a function called from a
+// dispatched statement dispatches its own queries).
+struct ArenaMapping {
+	dsm_segment *seg;
+	int refs;
+};
+std::unordered_map<dsm_handle, ArenaMapping> g_arena_mappings;
+
+dsm_segment *
+AttachArena(dsm_handle handle) {
+	auto it = g_arena_mappings.find(handle);
+	if (it != g_arena_mappings.end()) {
+		it->second.refs++;
+		return it->second.seg;
+	}
+	dsm_segment *seg = dsm_attach(handle);
+	if (!seg) {
+		return nullptr;
+	}
+	dsm_pin_mapping(seg);
+	g_arena_mappings[handle] = {seg, 1};
+	return seg;
+}
+
+void
+DetachArena(dsm_handle handle) {
+	auto it = g_arena_mappings.find(handle);
+	if (it == g_arena_mappings.end()) {
+		return;
+	}
+	if (--it->second.refs == 0) {
+		dsm_detach(it->second.seg);
+		g_arena_mappings.erase(it);
+	}
+}
 
 // Sessions are deleted only at top-level transaction end or process exit,
 // when no executor state can still hold one. A subtransaction abort just
@@ -314,6 +374,11 @@ BackendSession::Release() {
 		dsm_detach(seg_);
 		seg_ = nullptr;
 	}
+	strings_.clear();
+	if (arena_seg_) {
+		DetachArena(arena_handle_);
+		arena_seg_ = nullptr;
+	}
 }
 
 // Finds the database's worker or spawns one; waits until it is running.
@@ -326,6 +391,7 @@ BackendSession::EnsureWorker() {
 		entry = FindEntry(dboid_);
 		if (entry && entry->state == WORKER_RUNNING) {
 			worker_gen_ = entry->generation;
+			arena_handle_ = entry->arena_handle;
 			SpinLockRelease(&g_shmem->lock);
 			return;
 		}
@@ -398,6 +464,7 @@ BackendSession::EnsureWorker() {
 			bool running = entry->state == WORKER_RUNNING && entry->dboid == dboid_;
 			if (running) {
 				worker_gen_ = entry->generation;
+				arena_handle_ = entry->arena_handle;
 			}
 			bool stopped = status == BGWH_STOPPED;
 			if (stopped && entry->state == WORKER_STARTING && entry->starter_pid == MyProcPid) {
@@ -520,8 +587,38 @@ BackendSession::Open(QueryFrame &frame) {
 	resp_ = shm_mq_attach(resp_mq_, seg_, nullptr);
 	MemoryContextSwitchTo(old_context);
 
+	arena_seg_ = AttachArena(arena_handle_);
+	if (!arena_seg_) {
+		throw duckdb::IOException("duckdb worker exited before accepting the query");
+	}
+	auto *arena = (ArenaHeader *)dsm_segment_address(arena_seg_);
+	if (ARENA_PAGES_OFFSET + (Size)arena->page_size * arena->page_count > dsm_segment_map_length(arena_seg_)) {
+		throw duckdb::IOException("duckdb worker arena header does not match its segment");
+	}
+	arena_page_size_ = arena->page_size;
+	arena_page_count_ = arena->page_count;
+	arena_base_ = (char *)arena + ARENA_PAGES_OFFSET;
+
 	Post();
 	Send(EncodeQueryFrame(frame));
+}
+
+void
+BackendSession::FreeHeldPage() {
+	if (held_page_ == NO_PAGE || released_) {
+		return;
+	}
+	uint32 page = held_page_;
+	held_page_ = NO_PAGE;
+	strings_.clear();
+	std::string frame = EncodeChunkFreeFrame(page);
+	for (;;) {
+		shm_mq_result res = SendNowait(req_, frame);
+		if (res == SHM_MQ_SUCCESS || res == SHM_MQ_DETACHED) {
+			return; // a closed session has reclaimed its pages already
+		}
+		WaitForWorker();
+	}
 }
 
 duckdb::unique_ptr<duckdb::DataChunk>
@@ -546,6 +643,14 @@ BackendSession::ReceiveOne(bool &received) {
 		return nullptr;
 	case FrameTag::CHUNK:
 		return DecodeChunkFrame(bytes, len);
+	case FrameTag::CHUNK_REF: {
+		uint32 page = DecodeChunkRefFrame(bytes, len);
+		if (page >= arena_page_count_) {
+			throw duckdb::IOException("duckdb worker referenced an invalid arena page");
+		}
+		held_page_ = page;
+		return ReadPage(arena_base_ + (size_t)page * arena_page_size_, arena_page_size_, types_, strings_);
+	}
 	case FrameTag::DONE:
 		done_ = true;
 		return nullptr;
@@ -579,6 +684,7 @@ BackendSession::Types() {
 
 duckdb::unique_ptr<duckdb::DataChunk>
 BackendSession::Fetch() {
+	FreeHeldPage();
 	while (!done_) {
 		bool received;
 		auto chunk = ReceiveOne(received);
@@ -614,10 +720,29 @@ struct WorkerSession {
 	std::condition_variable cv;
 	std::deque<std::string> outbox;
 	size_t outbox_bytes = 0;
-	bool cancelled = false;
+	std::atomic<bool> cancelled {false};
 	enum { RPC_NONE, RPC_PENDING, RPC_REPLIED, RPC_FAILED } rpc = RPC_NONE;
 	std::string rpc_reply;
+
+	// Arena pages, guarded by g_arena.mu.
+	uint32 credit = 0;           // reserved pages not in use
+	uint32 overflow_held = 0;    // pages taken from the shared overflow
+	std::vector<uint32> writing; // taken, not yet referenced by a frame
+	std::vector<uint32> held;    // referenced by a frame; the backend frees them
 };
+
+// Page accounting, guarded by mu. free_pages always holds at least
+// reserved_outstanding pages, so a session with credit never waits.
+struct Arena {
+	dsm_segment *seg = nullptr;
+	char *base = nullptr;
+	uint32 page_size = 0;
+	uint32 page_count = 0;
+	std::mutex mu;
+	std::condition_variable cv;
+	std::vector<uint32> free_pages;
+	uint32 reserved_outstanding = 0;
+} g_arena;
 
 std::vector<std::unique_ptr<WorkerSession>> g_sessions;
 std::mutex g_ctx_mutex;
@@ -631,6 +756,91 @@ SessionFor(duckdb::ClientContext &context) {
 	std::lock_guard<std::mutex> lock(g_ctx_mutex);
 	auto it = g_ctx_sessions.find(&context);
 	return it == g_ctx_sessions.end() ? nullptr : it->second;
+}
+
+// Session thread: a reserved page if the session has credit left, else an
+// overflow page beyond what other sessions are promised.
+uint32
+AcquirePage(WorkerSession &s) {
+	std::unique_lock<std::mutex> lock(g_arena.mu);
+	g_arena.cv.wait(
+	    lock, [&] { return s.cancelled || s.credit > 0 || g_arena.free_pages.size() > g_arena.reserved_outstanding; });
+	if (s.cancelled) {
+		throw duckdb::InterruptException();
+	}
+	uint32 page = g_arena.free_pages.back();
+	g_arena.free_pages.pop_back();
+	if (s.credit > 0) {
+		s.credit--;
+		g_arena.reserved_outstanding--;
+	} else {
+		s.overflow_held++;
+	}
+	s.writing.push_back(page);
+	return page;
+}
+
+// Session thread: the page is written and about to be referenced by a frame.
+void
+PublishPage(WorkerSession &s, uint32 page) {
+	std::lock_guard<std::mutex> lock(g_arena.mu);
+	s.writing.erase(std::find(s.writing.begin(), s.writing.end(), page));
+	s.held.push_back(page);
+}
+
+// Main thread: the backend is done with one of the session's pages.
+void
+FreePage(WorkerSession &s, uint32 page) {
+	std::lock_guard<std::mutex> lock(g_arena.mu);
+	auto it = std::find(s.held.begin(), s.held.end(), page);
+	if (it == s.held.end()) {
+		return;
+	}
+	s.held.erase(it);
+	g_arena.free_pages.push_back(page);
+	if (s.overflow_held > 0) {
+		s.overflow_held--;
+	} else {
+		s.credit++;
+		g_arena.reserved_outstanding++;
+	}
+	g_arena.cv.notify_all();
+}
+
+// Main thread, after the session thread exited: everything goes back.
+void
+ReclaimPages(WorkerSession &s) {
+	std::lock_guard<std::mutex> lock(g_arena.mu);
+	for (uint32 page : s.held) {
+		g_arena.free_pages.push_back(page);
+	}
+	for (uint32 page : s.writing) {
+		g_arena.free_pages.push_back(page);
+	}
+	s.held.clear();
+	s.writing.clear();
+	g_arena.reserved_outstanding -= s.credit;
+	s.credit = 0;
+	s.overflow_held = 0;
+	g_arena.cv.notify_all();
+}
+
+// Main thread: promise `count` pages to a session about to be admitted.
+bool
+ReservePages(uint32 count) {
+	std::lock_guard<std::mutex> lock(g_arena.mu);
+	if (g_arena.free_pages.size() - g_arena.reserved_outstanding < count) {
+		return false;
+	}
+	g_arena.reserved_outstanding += count;
+	return true;
+}
+
+void
+UnreservePages(uint32 count) {
+	std::lock_guard<std::mutex> lock(g_arena.mu);
+	g_arena.reserved_outstanding -= count;
+	g_arena.cv.notify_all();
 }
 
 // Session thread: queue a frame for the main thread; dropped once cancelled.
@@ -672,11 +882,37 @@ RunSessionQuery(WorkerSession &s) {
 		result->ThrowError();
 	}
 	PushFrame(s, EncodeSchemaFrame(result->types));
+	bool by_reference = PageLayoutSupported(result->types);
 	while (auto chunk = result->Fetch()) {
 		if (chunk->size() == 0) {
 			break;
 		}
-		PushFrame(s, EncodeChunkFrame(*chunk));
+		if (!by_reference) {
+			PushFrame(s, EncodeChunkFrame(*chunk));
+			continue;
+		}
+		chunk->Flatten();
+		idx_t start = 0;
+		while (start < chunk->size()) {
+			idx_t rows = RowsThatFitPage(*chunk, start, g_arena.page_size);
+			if (rows == 0) {
+				// A row larger than a page: the rest of the chunk travels serialized.
+				duckdb::DataChunk rest;
+				rest.Initialize(duckdb::Allocator::DefaultAllocator(), chunk->GetTypes());
+				chunk->Copy(rest, start);
+				PushFrame(s, EncodeChunkFrame(rest));
+				break;
+			}
+			uint32 page = AcquirePage(s);
+			WritePage(*chunk, start, rows, g_arena.base + (size_t)page * g_arena.page_size);
+			PublishPage(s, page);
+			PushFrame(s, EncodeChunkRefFrame(page));
+			start += rows;
+		}
+	}
+	// A streaming result reports an error in a later batch through Fetch.
+	if (result->HasError()) {
+		result->ThrowError();
 	}
 	PushFrame(s, EncodeDoneFrame());
 }
@@ -731,6 +967,12 @@ DetachSession(WorkerSession &s) {
 		}
 	}
 	s.cv.notify_all();
+	{
+		// Taking the arena mutex orders this after any predicate check in
+		// AcquirePage that has not started waiting yet, so the wakeup is never lost.
+		std::lock_guard<std::mutex> lock(g_arena.mu);
+	}
+	g_arena.cv.notify_all();
 	if (s.started) {
 		s.con->Interrupt();
 	}
@@ -766,6 +1008,9 @@ PumpSession(WorkerSession &s) {
 			s.cv.notify_all();
 			break;
 		}
+		case FrameTag::CHUNK_FREE:
+			FreePage(s, DecodeChunkFreeFrame(bytes, len));
+			break;
 		default:
 			DetachSession(s);
 			break;
@@ -805,8 +1050,15 @@ SessionFinished(WorkerSession &s) {
 	if (!s.started) {
 		return false; // waiting for the QUERY frame
 	}
-	std::lock_guard<std::mutex> lock(s.mu);
-	return s.outbox.empty() && s.inflight.empty();
+	{
+		std::lock_guard<std::mutex> lock(s.mu);
+		if (!s.outbox.empty() || !s.inflight.empty()) {
+			return false;
+		}
+	}
+	// Pages stay the backend's until it frees them or detaches.
+	std::lock_guard<std::mutex> lock(g_arena.mu);
+	return s.held.empty() && s.writing.empty();
 }
 
 void
@@ -814,6 +1066,7 @@ CloseSession(WorkerSession &s) {
 	if (s.started) {
 		s.thread.join();
 	}
+	ReclaimPages(s); // only after the join: the thread may have been writing a page
 	shm_mq_detach(s.req);
 	shm_mq_detach(s.resp);
 	dsm_detach(s.seg);
@@ -864,26 +1117,35 @@ UndoAdmission() {
 	SpinLockRelease(&g_shmem->lock);
 }
 
-// Admits posted sessions while below capacity: attach, validate, connect.
+// Admits posted sessions while below capacity and while the arena can
+// reserve their pages: attach, validate, connect.
 void
 AdmitSessions() {
+	auto &settings = WorkerInternals::SettingsOf(*g_worker);
 	for (;;) {
-		int max_sessions = *WorkerInternals::SettingsOf(*g_worker).max_sessions;
+		int max_sessions = *settings.max_sessions;
 		if ((int)g_sessions.size() >= (max_sessions < 1 ? 1 : max_sessions)) {
+			return;
+		}
+		uint32 reserved = std::min((uint32)std::max(*settings.reserved_pages, 1), g_arena.page_count);
+		if (!ReservePages(reserved)) {
 			return;
 		}
 		MailboxEntry entry;
 		if (!PopMailbox(entry)) {
+			UnreservePages(reserved);
 			return;
 		}
 		if (dsm_find_mapping(entry.handle)) {
 			UndoAdmission(); // a backend reposted a session we already serve
+			UnreservePages(reserved);
 			continue;
 		}
 		WorkerInternals::BeforeSession(*g_worker);
 		dsm_segment *seg = dsm_attach(entry.handle);
 		if (!seg) {
 			UndoAdmission(); // the backend is gone; the segment with it
+			UnreservePages(reserved);
 			continue;
 		}
 		dsm_pin_mapping(seg);
@@ -892,9 +1154,11 @@ AdmitSessions() {
 		if (hdr->nonce != entry.nonce) {
 			dsm_detach(seg); // the handle was reused by a newer session
 			UndoAdmission();
+			UnreservePages(reserved);
 			continue;
 		}
 		auto session = std::make_unique<WorkerSession>();
+		session->credit = reserved;
 		session->seg = seg;
 		session->req_mq = (shm_mq *)(base + REQUEST_OFFSET);
 		session->resp_mq = (shm_mq *)(base + RESPONSE_OFFSET);
@@ -911,6 +1175,7 @@ AdmitSessions() {
 			shm_mq_detach(session->resp);
 			dsm_detach(seg);
 			UndoAdmission();
+			UnreservePages(reserved);
 			continue;
 		}
 		g_sessions.push_back(std::move(session));
@@ -975,10 +1240,24 @@ WorkerMainLoop(DuckdbWorker &worker, Oid dboid) {
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
+	auto &settings = WorkerInternals::SettingsOf(worker);
+	g_arena.page_size = (uint32)std::max(*settings.page_size_kb, 64) * 1024;
+	g_arena.page_count = (uint32)std::max(*settings.arena_pages, 1);
+	g_arena.seg = dsm_create(ARENA_PAGES_OFFSET + (Size)g_arena.page_size * g_arena.page_count, 0);
+	dsm_pin_mapping(g_arena.seg);
+	auto *arena = (ArenaHeader *)dsm_segment_address(g_arena.seg);
+	arena->page_size = g_arena.page_size;
+	arena->page_count = g_arena.page_count;
+	g_arena.base = (char *)arena + ARENA_PAGES_OFFSET;
+	for (uint32 page = g_arena.page_count; page > 0; page--) {
+		g_arena.free_pages.push_back(page - 1);
+	}
+
 	SpinLockAcquire(&g_shmem->lock);
 	entry->state = WORKER_RUNNING;
 	entry->generation++;
 	entry->latch = MyLatch;
+	entry->arena_handle = dsm_segment_handle(g_arena.seg);
 	SpinLockRelease(&g_shmem->lock);
 	elog(LOG, "duckdb worker started for database %u", dboid);
 

@@ -15,14 +15,16 @@ namespace pgddb {
 
 enum class FrameTag : uint8_t {
 	// backend -> worker
-	QUERY = 1,     // the query to run: sql, parameters, session settings
-	RPC_REPLY = 2, // reply to an RPC frame; payload is extension-defined
+	QUERY = 1,      // the query to run: sql, parameters, session settings
+	RPC_REPLY = 2,  // reply to an RPC frame; payload is extension-defined
+	CHUNK_FREE = 3, // the backend is done with an arena page
 	// worker -> backend
 	SCHEMA = 10,      // result column types, sent once before any chunk
-	CHUNK = 11,       // one result DataChunk
+	CHUNK = 11,       // one serialized result DataChunk (nested types, oversized rows)
 	DONE = 12,        // the result is complete
 	QUERY_ERROR = 13, // the query failed: exception type + message
 	RPC = 14,         // the worker needs the backend; payload is extension-defined
+	CHUNK_REF = 15,   // one result chunk, laid out by reference in an arena page
 };
 
 struct QueryFrame {
@@ -59,5 +61,26 @@ ErrorFrame DecodeErrorFrame(const char *data, size_t len);
 // type + message) or names, types and rows. Encoding consumes the result.
 std::string EncodeQueryResult(duckdb::QueryResult &result);
 duckdb::unique_ptr<duckdb::QueryResult> DecodeQueryResult(const std::string &payload);
+
+// Arena pages: a result chunk written once into shared memory by the worker
+// and read in place by the backend. Fixed-width columns are stored as their
+// flat vector data, text and blob columns as offsets plus bytes, each with
+// an optional validity mask; nested types are not supported and travel as
+// serialized CHUNK frames instead.
+std::string EncodeChunkRefFrame(uint32_t page);
+uint32_t DecodeChunkRefFrame(const char *data, size_t len);
+std::string EncodeChunkFreeFrame(uint32_t page);
+uint32_t DecodeChunkFreeFrame(const char *data, size_t len);
+
+bool PageLayoutSupported(const duckdb::vector<duckdb::LogicalType> &types);
+// Rows of the flat `chunk`, starting at `start`, that fit into `capacity`
+// bytes; 0 when even the first row does not fit.
+duckdb::idx_t RowsThatFitPage(duckdb::DataChunk &chunk, duckdb::idx_t start, size_t capacity);
+void WritePage(duckdb::DataChunk &chunk, duckdb::idx_t start, duckdb::idx_t count, char *page);
+// The chunk references `page` and `strings` (text/blob pointers into the page);
+// both must outlive it.
+duckdb::unique_ptr<duckdb::DataChunk> ReadPage(const char *page, size_t capacity,
+                                               const duckdb::vector<duckdb::LogicalType> &types,
+                                               duckdb::vector<duckdb::unsafe_unique_array<duckdb::string_t>> &strings);
 
 } // namespace pgddb

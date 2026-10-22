@@ -50,7 +50,8 @@ namespace pgducklake {
 
 DuckLakeWorker::DuckLakeWorker()
     : pgddb::DuckdbWorker(Settings {"pg_ducklake duckdb worker", "pg_ducklake", "pgducklake_duckdb_worker_main",
-                                    &max_worker_sessions}) {
+                                    &max_worker_sessions, &worker_page_size, &worker_arena_pages,
+                                    &worker_reserved_pages}) {
 }
 
 DuckLakeWorker &

@@ -856,9 +856,13 @@ DucklakeUtilityHook(PlannedStmt *pstmt, const char *query_string, bool read_only
 
 	pgducklake::HandleDropSortedIndex(sorted_drops);
 
-	// Detach the catalog so a subsequent CREATE EXTENSION can attach a fresh one.
+	// Detach the catalog so a subsequent CREATE EXTENSION can attach a fresh one. Only when this
+	// process already runs DuckDB: otherwise there is nothing attached, and detaching would first
+	// create the instance and ATTACH the catalog this very statement just dropped, which fails with
+	// "EnsureSnapshotTrigger failed" and aborts the DROP EXTENSION.
 	if (dropping_extension) {
-		ducklake_detach_catalog();
+		if (pgducklake::DuckDBManager::IsInitialized())
+			ducklake_detach_catalog();
 		InvalidateVariantCaches();
 	}
 }

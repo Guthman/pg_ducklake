@@ -263,6 +263,9 @@ Duckdb_ExecCustomScan_Cpp(CustomScanState *node) {
 			// scan, so the empty tuple means "no RETURNING rows".
 			if (duckdb_scan_state->query->commandType != CMD_SELECT && !IsPostgresInsert(duckdb_scan_state->query)) {
 				auto chunk = duckdb_scan_state->query_results->Fetch();
+				if (!chunk && duckdb_scan_state->query_results->HasError()) {
+					duckdb_scan_state->query_results->ThrowError();
+				}
 				uint64_t processed = 0;
 				if (chunk && chunk->size() > 0 && chunk->ColumnCount() > 0) {
 					try {
@@ -283,6 +286,10 @@ Duckdb_ExecCustomScan_Cpp(CustomScanState *node) {
 			duckdb_scan_state->current_row = 0;
 			duckdb_scan_state->fetch_next = false;
 			if (!duckdb_scan_state->current_data_chunk || duckdb_scan_state->current_data_chunk->size() == 0) {
+				// A streamed result reports a Fetch() failure as a null chunk plus a stored error.
+				if (duckdb_scan_state->query_results->HasError()) {
+					duckdb_scan_state->query_results->ThrowError();
+				}
 				MemoryContextReset(duckdb_scan_state->css.ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
 				ExecClearTuple(slot);
 				return slot;
@@ -372,6 +379,9 @@ Duckdb_ExplainCustomScan_Cpp(CustomScanState *node, ExplainState *es) {
 
 	auto chunk = duckdb_scan_state->query_results->Fetch();
 	if (!chunk || chunk->size() == 0) {
+		if (duckdb_scan_state->query_results->HasError()) {
+			duckdb_scan_state->query_results->ThrowError();
+		}
 		return;
 	}
 
@@ -382,6 +392,9 @@ Duckdb_ExplainCustomScan_Cpp(CustomScanState *node, ExplainState *es) {
 	do {
 		chunk = duckdb_scan_state->query_results->Fetch();
 	} while (chunk && chunk->size() > 0);
+	if (duckdb_scan_state->query_results->HasError()) {
+		duckdb_scan_state->query_results->ThrowError();
+	}
 
 	std::ostringstream explain_output;
 	explain_output << "\n\n" << value << "\n";

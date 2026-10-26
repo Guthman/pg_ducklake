@@ -3,6 +3,7 @@
 #include "duckdb/common/exception.hpp"
 
 #include "pgddb/pgddb_planner.hpp"
+#include "pgddb/pgddb_table_am.hpp"
 #include "pgddb/pgddb_types.hpp"
 #include "pgddb/vendor/pg_explain.hpp"
 #include "pgddb/pg/explain.hpp"
@@ -193,8 +194,13 @@ ExecuteQuery(DuckdbScanState *state) {
 		named_values[duckdb::to_string(i + 1)] = duckdb::BoundParameterData(duckdb_param);
 	}
 
-	// Streaming a result that reads a Postgres table races on PG resources (e.g. CTAS); force full materialization.
-	bool allow_stream_result = !pgddb::ContainsPostgresTable((Node *)state->query, NULL);
+	// While a result streams, DuckDB workers keep running as the main thread runs PG code between fetches.
+	// A worker that reads a Postgres table (e.g. CTAS), or scans a consumer table that calls into Postgres,
+	// then races the main thread on PG resources; force full materialization. With one DuckDB thread no
+	// worker runs, so a consumer table can still stream.
+	bool include_consumer_tables =
+	    pgddb::table_am_scan_uses_postgres && state->duckdb_connection->context->db->NumberOfThreads() > 1;
+	bool allow_stream_result = !pgddb::ContainsPostgresTable((Node *)state->query, &include_consumer_tables);
 	auto pending = prepared.PendingQuery(named_values, allow_stream_result);
 	if (pending->HasError()) {
 		return pending->ThrowError();

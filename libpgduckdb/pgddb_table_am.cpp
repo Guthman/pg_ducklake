@@ -9,6 +9,7 @@ extern "C" {
 namespace pgddb {
 
 table_am_get_name_hook_t table_am_get_name_hook = nullptr;
+bool table_am_scan_uses_postgres = false;
 
 const char *
 TableAmGetName(const TableAmRoutine *am) {

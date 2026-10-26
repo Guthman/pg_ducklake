@@ -47,8 +47,9 @@ namespace pgddb {
 
 /*
  * True if any RangeTblEntry references a PG heap table (AM not registered with
- * libpgddb). The CustomScan uses this to materialize fully instead of streaming,
- * since concurrent PG access during stream-fetch could race. See
+ * libpgddb), or any table at all when `context` points to a true bool. The
+ * CustomScan uses this to materialize fully instead of streaming, since
+ * concurrent PG access during stream-fetch could race. See
  * https://github.com/duckdb/pg_duckdb/discussions/866.
  */
 bool
@@ -67,7 +68,7 @@ ContainsPostgresTable(Node *node, void *context) {
 				/* Tables referenced in the view are also in the rtable */
 				continue;
 			}
-			if (pgddb::TableAmGetName(rte->relid) == nullptr) {
+			if (pgddb::TableAmGetName(rte->relid) == nullptr || (context && *(bool *)context)) {
 				return true;
 			}
 		}

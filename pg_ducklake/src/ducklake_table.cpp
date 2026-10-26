@@ -1231,6 +1231,8 @@ DucklakeTableAmHook(const TableAmRoutine *am) {
 void
 InitTableAmHook() {
 	pgddb::table_am_get_name_hook = DucklakeTableAmHook;
+	/* DuckLake reads its catalog through SPI, on whichever DuckDB thread needs it. */
+	pgddb::table_am_scan_uses_postgres = true;
 }
 
 } // namespace pgducklake
